@@ -3,11 +3,14 @@ const axios = require("axios");
 const xml2js = require("xml2js");
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
-const SITE_SITEMAP = "https://torrentdosfilmes2.xyz/sitemap_index.xml";
+const TARGET_URL = "https://torrentdosfilmes2.xyz/sitemap_index.xml";
+
+// Uso de proxy publico para ignorar o bloqueio de Cloudflare/IP do Render
+const PROXY_URL = `https://api.allorigins.win/raw?url=${encodeURIComponent(TARGET_URL)}`;
 
 const manifest = {
   id: "com.nuvio.tdflancamentos",
-  version: "1.0.2",
+  version: "1.0.3",
   name: "TDF - Lançamentos",
   description: "Catálogo por ordem de adição do Torrent dos Filmes.",
   resources: ["catalog"],
@@ -23,33 +26,35 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-const customHeaders = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-};
-
 async function getLatestPosts() {
   try {
-    const response = await axios.get(SITE_SITEMAP, { headers: customHeaders, timeout: 10000 });
+    console.log("Solicitando sitemap index via proxy...");
+    const response = await axios.get(PROXY_URL, { timeout: 15000 });
+    
     const parser = new xml2js.Parser();
     const result = await parser.parseStringPromise(response.data);
     
-    // Filtra o sitemap de posts
+    // Localiza o post-sitemap no index XML
     const sitemaps = result.sitemapindex.sitemap;
     const postSitemapObj = sitemaps.find(s => s.loc[0].includes("post-sitemap"));
     
-    if (!postSitemapObj) return [];
+    if (!postSitemapObj) {
+      console.error("Nenhum post-sitemap encontrado no XML.");
+      return [];
+    }
 
     const postSitemapUrl = postSitemapObj.loc[0];
-    const postResponse = await axios.get(postSitemapUrl, { headers: customHeaders, timeout: 10000 });
+    const proxyPostUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(postSitemapUrl)}`;
+    
+    console.log("Solicitando post-sitemap via proxy...");
+    const postResponse = await axios.get(proxyPostUrl, { timeout: 15000 });
     const postResult = await parser.parseStringPromise(postResponse.data);
 
-    // Extrai os URLs do post-sitemap
+    // Mapeia e organiza os posts do site pela tag <lastmod>
     const items = postResult.urlset.url.map(u => {
       const loc = u.loc[0];
       const lastmod = u.lastmod ? u.lastmod[0] : null;
       
-      // Remove a barra final e pega o último segmento da URL
       const slug = loc.replace(/\/$/, "").split("/").pop();
       const title = slug.replace(/-/g, " ");
 
@@ -59,11 +64,10 @@ async function getLatestPosts() {
       };
     });
 
-    // Ordena do mais recente para o mais antigo e limita aos 25 primeiros
     items.sort((a, b) => b.date - a.date);
-    return items.slice(0, 25);
+    return items.slice(0, 20); // Retorna os 20 lançamentos mais recentes
   } catch (error) {
-    console.error("Erro ao ler Sitemap do site:", error.message);
+    console.error("Erro na busca do sitemap:", error.message);
     return [];
   }
 }
@@ -72,7 +76,7 @@ async function getTmdbMeta(title) {
   if (!TMDB_API_KEY) return null;
 
   try {
-    // Limpa palavras comuns de títulos de torrent para otimizar a busca no TMDB
+    // Limpa palavras comuns de release torrent para otimizar o matching no TMDB
     const cleanSearch = title
       .replace(/(torrent|download|dublado|legendado|dual|audio|web-dl|bluray|720p|1080p|4k|\d{4})/gi, "")
       .trim();
@@ -91,7 +95,7 @@ async function getTmdbMeta(title) {
       };
     }
   } catch (e) {
-    console.error("Erro ao converter título no TMDB:", e.message);
+    console.error("Erro na busca do TMDB:", e.message);
   }
   return null;
 }
