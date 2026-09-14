@@ -2,12 +2,14 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 const xml2js = require("xml2js");
 
+// Chaves de API e URLs
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || "cba201758865599e63aa28e3d821568a";
 const SITE_SITEMAP = "https://torrentdosfilmes2.xyz/sitemap_index.xml";
 
 const manifest = {
   id: "com.nuvio.tdflancamentos",
-  version: "1.0.3",
+  version: "1.0.7",
   name: "TDF - Lançamentos",
   description: "Catálogo por ordem de adição do Torrent dos Filmes.",
   resources: ["catalog"],
@@ -23,22 +25,23 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// Função para fazer requisição via proxy e burlar bloqueio de Cloudflare
-async function fetchXmlThroughProxy(targetUrl) {
+// Função para buscar páginas ignorando o Cloudflare via ScraperAPI
+async function fetchXmlThroughScraper(targetUrl) {
   try {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-    const response = await axios.get(proxyUrl, { timeout: 10000 });
+    const url = `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(targetUrl)}`;
+    const response = await axios.get(url, { timeout: 20000 });
     return response.data;
   } catch (err) {
-    console.error("Erro ao buscar via proxy:", err.message);
+    console.error(`Erro ao buscar ${targetUrl} via ScraperAPI:`, err.message);
     return null;
   }
 }
 
+// Extrai e ordena os posts mais recentes do sitemap
 async function getLatestPosts() {
   try {
     console.log("Buscando sitemap principal...");
-    const xmlData = await fetchXmlThroughProxy(SITE_SITEMAP);
+    const xmlData = await fetchXmlThroughScraper(SITE_SITEMAP);
     if (!xmlData) return [];
 
     const parser = new xml2js.Parser();
@@ -48,14 +51,14 @@ async function getLatestPosts() {
     const postSitemapObj = sitemaps.find(s => s.loc[0].includes("post-sitemap"));
 
     if (!postSitemapObj) {
-      console.error("Sitemap de posts não encontrado no XML.");
+      console.error("Sitemap de posts não encontrado.");
       return [];
     }
 
     const postSitemapUrl = postSitemapObj.loc[0];
     console.log("Buscando post-sitemap:", postSitemapUrl);
 
-    const postXmlData = await fetchXmlThroughProxy(postSitemapUrl);
+    const postXmlData = await fetchXmlThroughScraper(postSitemapUrl);
     if (!postXmlData) return [];
 
     const postResult = await parser.parseStringPromise(postXmlData);
@@ -73,7 +76,7 @@ async function getLatestPosts() {
       };
     });
 
-    // Ordena do mais recente para o mais antigo
+    // Ordena do mais recente para o mais antigo e limita aos 20 primeiros
     items.sort((a, b) => b.date - a.date);
     return items.slice(0, 20);
   } catch (error) {
@@ -82,11 +85,12 @@ async function getLatestPosts() {
   }
 }
 
+// Busca metadados (poster, nome, sinopse) no TMDB
 async function getTmdbMeta(title) {
   if (!TMDB_API_KEY) return null;
 
   try {
-    // Limpeza de termos comuns de torrent para garantir resultado no TMDB
+    // Tratamento e limpeza do nome do arquivo torrent
     const cleanSearch = title
       .replace(/(torrent|download|dublado|legendado|dual|audio|web-dl|bluray|720p|1080p|4k|\d{4})/gi, "")
       .trim();
@@ -110,13 +114,13 @@ async function getTmdbMeta(title) {
   return null;
 }
 
+// Handler do catálogo
 builder.defineCatalogHandler(async ({ id }) => {
   if (id === "tdf_latest") {
-    console.log("Processando requisição de catálogo...");
+    console.log("Recebida requisição de catálogo...");
     const posts = await getLatestPosts();
 
     if (posts.length === 0) {
-      console.log("Nenhum post extraído do sitemap.");
       return { metas: [] };
     }
 
@@ -124,7 +128,7 @@ builder.defineCatalogHandler(async ({ id }) => {
     const metasResults = await Promise.all(metasPromises);
     const metas = metasResults.filter(Boolean);
 
-    console.log(`Sucesso: ${metas.length} filmes retornados ao Nuvio.`);
+    console.log(`Sucesso: ${metas.length} itens retornados.`);
     return { metas };
   }
   return { metas: [] };
