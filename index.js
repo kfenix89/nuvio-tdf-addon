@@ -3,11 +3,11 @@ const axios = require("axios");
 const xml2js = require("xml2js");
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
-const TARGET_URL = "https://torrentdosfilmes2.xyz/sitemap_index.xml";
+const SITE_SITEMAP = "https://torrentdosfilmes2.xyz/sitemap_index.xml";
 
 const manifest = {
   id: "com.nuvio.tdflancamentos",
-  version: "1.0.5",
+  version: "1.0.3",
   name: "TDF - Lançamentos",
   description: "Catálogo por ordem de adição do Torrent dos Filmes.",
   resources: ["catalog"],
@@ -23,69 +23,78 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// Memória local para entrega instantânea ao Nuvio
-let catalogMemory = [];
-
-// Função de scraping via JSDelivr/CORS proxy com timeout curto
-async function fetchLatestFromSite() {
-  console.log("[CRON] Atualizando catálogo em segundo plano...");
+// Função para fazer requisição via proxy e burlar bloqueio de Cloudflare
+async function fetchXmlThroughProxy(targetUrl) {
   try {
-    // Tenta obter o sitemap via proxy
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(TARGET_URL)}`;
-    const response = await axios.get(proxyUrl, { 
-      timeout: 8000,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-    });
-    
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+    const response = await axios.get(proxyUrl, { timeout: 10000 });
+    return response.data;
+  } catch (err) {
+    console.error("Erro ao buscar via proxy:", err.message);
+    return null;
+  }
+}
+
+async function getLatestPosts() {
+  try {
+    console.log("Buscando sitemap principal...");
+    const xmlData = await fetchXmlThroughProxy(SITE_SITEMAP);
+    if (!xmlData) return [];
+
     const parser = new xml2js.Parser();
-    const result = await parser.parseStringPromise(response.data);
-    
+    const result = await parser.parseStringPromise(xmlData);
+
     const sitemaps = result.sitemapindex.sitemap;
     const postSitemapObj = sitemaps.find(s => s.loc[0].includes("post-sitemap"));
-    if (!postSitemapObj) return;
+
+    if (!postSitemapObj) {
+      console.error("Sitemap de posts não encontrado no XML.");
+      return [];
+    }
 
     const postSitemapUrl = postSitemapObj.loc[0];
-    const proxyPostUrl = `https://corsproxy.io/?${encodeURIComponent(postSitemapUrl)}`;
-    const postResponse = await axios.get(proxyPostUrl, { timeout: 8000 });
-    const postResult = await parser.parseStringPromise(postResponse.data);
+    console.log("Buscando post-sitemap:", postSitemapUrl);
+
+    const postXmlData = await fetchXmlThroughProxy(postSitemapUrl);
+    if (!postXmlData) return [];
+
+    const postResult = await parser.parseStringPromise(postXmlData);
 
     const items = postResult.urlset.url.map(u => {
       const loc = u.loc[0];
       const lastmod = u.lastmod ? u.lastmod[0] : null;
-      const slug = loc.replace(/\/$/, "").split("/").pop();
+
+      const slug = loc.replace(/\/$/, "").split("/").pop() || "";
       const title = slug.replace(/-/g, " ");
 
-      return { title, date: lastmod ? new Date(lastmod) : new Date(0) };
+      return {
+        title: title,
+        date: lastmod ? new Date(lastmod) : new Date(0)
+      };
     });
 
+    // Ordena do mais recente para o mais antigo
     items.sort((a, b) => b.date - a.date);
-    const topItems = items.slice(0, 15);
-
-    // Consulta o TMDB
-    const metasPromises = topItems.map(p => getTmdbMeta(p.title));
-    const metasResults = await Promise.all(metasPromises);
-    const validMetas = metasResults.filter(Boolean);
-
-    if (validMetas.length > 0) {
-      catalogMemory = validMetas;
-      console.log(`[CRON] Catálogo atualizado com sucesso! Total: ${validMetas.length} itens.`);
-    }
+    return items.slice(0, 20);
   } catch (error) {
-    console.error("[CRON] Erro ao atualizar catálogo:", error.message);
+    console.error("Erro ao processar sitemap:", error.message);
+    return [];
   }
 }
 
 async function getTmdbMeta(title) {
   if (!TMDB_API_KEY) return null;
+
   try {
+    // Limpeza de termos comuns de torrent para garantir resultado no TMDB
     const cleanSearch = title
       .replace(/(torrent|download|dublado|legendado|dual|audio|web-dl|bluray|720p|1080p|4k|\d{4})/gi, "")
       .trim();
 
     const url = `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(cleanSearch)}&language=pt-BR`;
-    const res = await axios.get(url, { timeout: 3000 });
-    
-    if (res.data && res.data.results && res.data.results.length > 0) {
+    const res = await axios.get(url, { timeout: 5000 });
+
+    if (res.data.results && res.data.results.length > 0) {
       const movie = res.data.results[0];
       return {
         id: `tmdb:${movie.id}`,
@@ -96,25 +105,30 @@ async function getTmdbMeta(title) {
       };
     }
   } catch (e) {
-    // Silencia erros individuais do TMDB
+    console.error("Erro na busca TMDB:", e.message);
   }
   return null;
 }
 
-// Resposta imediata ao Nuvio
 builder.defineCatalogHandler(async ({ id }) => {
   if (id === "tdf_latest") {
-    // Retorna instantaneamente o que estiver na memória
-    return { metas: catalogMemory };
+    console.log("Processando requisição de catálogo...");
+    const posts = await getLatestPosts();
+
+    if (posts.length === 0) {
+      console.log("Nenhum post extraído do sitemap.");
+      return { metas: [] };
+    }
+
+    const metasPromises = posts.map(p => getTmdbMeta(p.title));
+    const metasResults = await Promise.all(metasPromises);
+    const metas = metasResults.filter(Boolean);
+
+    console.log(`Sucesso: ${metas.length} filmes retornados ao Nuvio.`);
+    return { metas };
   }
   return { metas: [] };
 });
-
-// Executa a primeira busca ao iniciar o servidor
-fetchLatestFromSite();
-
-// Executa a atualização a cada 30 minutos em segundo plano
-setInterval(fetchLatestFromSite, 30 * 60 * 1000);
 
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port });
